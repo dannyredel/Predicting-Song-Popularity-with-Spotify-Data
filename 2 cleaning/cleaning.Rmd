@@ -1,0 +1,216 @@
+---
+title: "cleaning"
+author: "Daniel Redel"
+date: "2022-10-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(dplyr)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(rattle)
+library(MLmetrics)
+library(e1071)
+library(neuralnet)
+library(pROC)
+library(vtable)
+
+#rm(list=ls())
+
+## Spotify Color Palette
+spotycolor <- c("#33D66D", "#0DDEB4", "#7BE070", "#10C76B", "#4AC2AC")
+
+
+```
+
+## Data Import
+```{r, include=FALSE}
+
+library(readr)
+tracks <- read_csv("1 data/tracks.csv")
+tracks
+
+
+```
+
+## Cleaning
+We choose the relevant variables: 
+```{r}
+
+data1 <- tracks %>% 
+  separate(release_date, into = c("year", "month", "day")) %>% 
+  mutate(duration = round(duration_ms/1000, 2), duration_minutes = round(duration/60, 2)) %>% 
+  select(artists, popularity, year, tempo, duration, duration_minutes, key, explicit, danceability, energy, loudness, mode, speechiness, acousticness, instrumentalness, liveness, valence) %>% 
+  mutate(year=as.numeric(year), explicit=as.factor(explicit), mode=as.factor(mode))
+
+data1
+
+
+```
+
+### Artist Popularity Index
+We generate a variable reflecting popularity level of the artist from each song:
+```{r}
+
+popular <- data1 %>% 
+  group_by(artists) %>% 
+  summarise(avg_popularity = round(mean(popularity)/100, digits=2), n_songs = n()) %>% 
+  mutate(artist_popularity = case_when(n_songs <= 600 ~ avg_popularity, TRUE ~ 0)) %>% 
+  arrange(desc(n_songs))
+
+##We merge the data by #artists#
+data1 <- data1 %>% 
+  left_join(popular, by=c("artists"))
+
+```
+
+
+
+## Preliminar Analysis
+```{r}
+
+popular %>% 
+  arrange(desc(avg_popularity)) %>%
+  filter(avg_popularity >= 0.85) %>%
+  select(artists, artist_popularity) %>% 
+  kbl(caption = "Most Popular Artists") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+## Duration of Songs: Distribution
+summary(data1$duration)
+
+ggplot(data1, aes(x=duration)) + 
+  geom_histogram(binwidth=10, fill = "#33D66D") +
+  xlab("Song Duration (segs.)") + ylab("Frequency") +
+  theme_bw()
+
+quantile(data1$duration, 0.975) #457.6227
+
+data1 %>% 
+  filter(duration < 457.6227) %>% 
+ggplot(aes(x=duration)) + 
+  geom_histogram(binwidth=5, fill = "#33D66D") +
+  xlab("Song Duration (segs.)") + ylab("Frequency") +
+  theme_bw()
+
+
+
+```
+
+
+### Outliers
+```{r}
+
+## Tempo Outliers
+data1 <- data1 %>% 
+  filter(tempo>0)
+
+```
+
+### Correlation Matrix
+```{r, echo=FALSE}
+
+## HeatMap ##
+cormat <- round(cor(data1 %>% select(-artists, -avg_popularity, -n_songs, -mode)), 2)
+
+round(cor(data1 %>% select(-artists, popularity, duration)), 2)
+
+
+library(reshape2)
+melted_cormat <- melt(cormat)
+head(melted_cormat)
+
+cordata <- melted_cormat %>% 
+  mutate(vif=ifelse(value > 0.32 | value < -0.32, value, NA))
+
+### Plot "#CCF5DA
+p1 <- ggplot(data = cordata, aes(x=Var1, y=Var2, fill=value, label=vif)) + 
+  geom_tile()+
+ labs(x = NULL, y = NULL, fill = "Pearson's\nCorrelation", title="Correlation Matrix", subtitle="Only relevant Pearson's correlation coefficients shown") + scale_fill_gradient2(mid="#CCF5DA",low="#D46C7F",high="#33d66d", limits=c(-1,1)) +
+ theme_classic() +
+ scale_x_discrete(expand=c(0,0)) +
+ scale_y_discrete(expand=c(0,0)) +
+  geom_text(aes(Var2, Var1, label = vif), color = "black")
+
+p1
+
+
+ggsave('heatmap1.png', p1, width = 8, height = 5.2)
+
+```
+
+## Key Songs
+```{r, include=FALSE}
+
+
+## Key Dummies ##
+summary(data1$key)
+
+data1 <- data1 %>% 
+  mutate(C = case_when(key == 0  ~ 1, TRUE ~ 0),
+         Db = case_when(key == 1  ~ 1, TRUE ~ 0),
+         D = case_when(key == 2  ~ 1, TRUE ~ 0),
+         Eb = case_when(key == 3  ~ 1, TRUE ~ 0),
+         E = case_when(key == 4  ~ 1, TRUE ~ 0),
+         "F" = case_when(key == 5  ~ 1, TRUE ~ 0),
+         Gb = case_when(key == 6  ~ 1, TRUE ~ 0),
+         G = case_when(key == 7  ~ 1, TRUE ~ 0),
+         Ab = case_when(key == 8  ~ 1, TRUE ~ 0),
+         A = case_when(key == 9  ~ 1, TRUE ~ 0),
+         Bb = case_when(key == 10  ~ 1, TRUE ~ 0),
+         B = case_when(key == 11  ~ 1, TRUE ~ 0)) %>% 
+  select(-key)
+
+###Graph PIE
+
+key1 <- tracks %>% 
+  transmute(keycode=key) %>% 
+  group_by(keycode) %>% 
+  count() %>% 
+  arrange(keycode) %>% 
+  transmute(n=as.numeric(n))
+
+tonalidad <- c("C","Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B")
+
+keytable <- cbind(key1, tonalidad)
+colnames(keytable) <- c("code", "n", "tono")
+
+##Position
+keytable1 <- keytable %>% 
+  arrange(desc(tono)) %>%
+  mutate(prop = n/sum(keytable$n)*100) %>%
+  mutate(ypos = cumsum(prop)-0.5*prop)
+
+ggplot(keytable1, aes(x="", y=prop, fill=tono)) +
+  geom_bar(stat="identity", width=1, color="white") +
+  coord_polar("y", start=0) +
+  theme_void()
+
+
+
+```
+
+## Database Export
+```{r}
+
+## Export CSV File
+write.csv(data1, file = "spotify_data.csv", row.names = FALSE)
+
+## How it looks
+data1 %>% 
+  arrange(desc(popularity)) %>% 
+  filter(popularity>95) %>% 
+  kbl(caption = "Final Database") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+```
+
+
+
+
