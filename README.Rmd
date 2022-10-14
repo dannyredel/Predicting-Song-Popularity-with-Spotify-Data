@@ -1,0 +1,316 @@
+---
+title: "Predicting Popularity of Songs in Spotify"
+author: "Daniel Redel"
+date: "2022-10-14"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(dplyr)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(rattle)
+library(MLmetrics)
+library(e1071)
+library(neuralnet)
+library(pROC)
+library(vtable)
+library(reshape2)
+
+#rm(list=ls())
+
+## Spotify Color Palette
+spotycolor <- c("#33D66D", "#0DDEB4", "#7BE070", "#10C76B", "#4AC2AC")
+
+
+```
+
+```{r import, include=FALSE, cache=TRUE}
+
+library(readr)
+spotify_data <- read_csv("C:/Users/danny/OneDrive/Documents/Portfolio/Spotify/2 cleaning/spotify_data.csv") %>% 
+  select(-duration_minutes, -n_songs, -avg_popularity)
+
+```
+
+## 1. Pre-Process Data
+### 1.1. Normalization
+We only need to normalize those variables that don't take values between 0 and 1. We do that using the following function:
+$$ Norm_{i}=\frac{x_i-\min(x_i)}{\max(x_i)-\min(x_i)} $$ 
+
+```{r norm function}
+
+# Normalization Function
+nor <- function(x) {
+  (x-min(x))/(max(x)-min(x))
+}
+
+```
+
+```{r normalize0, include=FALSE, cache=TRUE}
+
+## Which ones needs normalization:
+summary(spotify_data)
+#year tempo duration | loudness
+
+```
+
+```{r normalize data, cache=TRUE, message=FALSE, warning=FALSE}
+
+## We Normalize our variables
+non_norm_var <- spotify_data[,c(3:5,9)]
+data2 <- as.data.frame(lapply(non_norm_var, nor))
+
+## Combine Data
+normaldata <- cbind(spotify_data[,1], data2, spotify_data[,-c(1, 3:5,9)])
+
+## Base final:
+data <- normaldata
+
+```
+
+### 1.2. Data Partition
+We split our data in a training sample and test sample. In this project, we will work with only a subsample of songs, for computer size reasons.
+```{r partition, cache=TRUE, message=FALSE, warning=FALSE}
+
+
+## Sub-sample
+set.seed(456789)
+sample <- data %>% sample_frac(0.10)
+
+## Train data and Test Data (70%-30%)
+set.seed(123456)
+
+r <- sample(nrow(sample))
+shuffle_df <- sample[r,]
+
+split <- round(nrow(shuffle_df)*.7)
+train <- shuffle_df[1:split,]
+test <-  shuffle_df[(split+1):nrow(shuffle_df),]
+
+```
+
+## 2. Descriptive Analysis
+
+### 2.1. Popularity Distribution
+```{r popularity distribution, echo=FALSE, cache=TRUE}
+
+sample %>% 
+  ggplot(aes(x=popularity)) + 
+  geom_histogram(binwidth=1, fill = "#33D66D") +
+  xlab("Popularity Index") + ylab("Frequency") +
+  theme_bw()
+
+
+```
+
+### 2.2. Heatmap Correlation
+```{r heatmap, echo=FALSE, cache=TRUE, message=FALSE, warning=FALSE}
+
+## HeatMap ##
+cormat <- round(cor(sample %>% select(-artists)), 2)
+
+melted_cormat <- melt(cormat)
+
+cordata <- melted_cormat %>% 
+  mutate(vif=ifelse(value > 0.32 | value < -0.32, value, NA))
+
+### Plot "#CCF5DA
+p1 <- ggplot(data = cordata, aes(x=Var1, y=Var2, fill=value, label=vif)) + 
+  geom_tile() +
+  labs(x = NULL, y = NULL, fill = "Pearson's\nCorrelation", title="Correlation Matrix", subtitle="Only relevant Pearson's correlation coefficients shown") +
+  scale_fill_gradient2(mid="#CCF5DA",low="#D46C7F",high="#33d66d", limits=c(-1,1)) +
+  scale_x_discrete(expand=c(0,0)) +
+  scale_y_discrete(expand=c(0,0)) +
+  geom_text(aes(Var2, Var1, label = vif), color = "black") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust=1)) 
+p1
+
+```
+
+## 3. Machine Learning Models for Prediction
+
+### 3.1. Regression Model
+```{r reg, cache=TRUE, message=FALSE, warning=FALSE}
+
+# Regression Prediction #
+model_reg <- lm(popularity ~ ., data = train[,c(2:28)])
+
+##Saving our Predictions
+pred_train0 <- predict(model_reg, train)
+pred_test0 <- predict(model_reg , newdata = test)
+
+```
+
+We now report their accuracy:
+```{r reg_results, echo=FALSE, cache=TRUE, message=FALSE, warning=FALSE}
+
+##############
+##ASSESSMENT##
+##############
+
+## Calidad de ajuste en Train 
+rmse_reg_train <- RMSE(pred_train0, train$popularity)
+rae_reg_train <- RAE(pred_train0, train$popularity)
+r2_reg_train <- R2_Score(pred_train0, train$popularity)
+## Validacion del modelo con Test
+rmse_reg_test <- RMSE(pred_test0, test$popularity)
+rae_reg_test <- RAE(pred_test0, test$popularity)
+r2_reg_test <- R2_Score(pred_test0, test$popularity)
+
+
+##TABLE###
+
+criterio <- c("RMSE", "RAE", "R2_Score")
+regresion <- c(rmse_reg_test, rae_reg_test, r2_reg_test)
+
+comtable <- data.frame(criterio, regresion) 
+colnames(comtable) <- c("Criteria", "Linear Regression")
+
+knitr::kable(comtable, "html")
+
+
+```
+
+### 3.2. Decision Trees N°1:
+
+```{r decision tree1 model, cache=TRUE, message=FALSE, warning=FALSE}
+
+# Regression Tree #
+model_tree0 <- rpart(popularity ~ ., 
+                    data = train[,c(2:28)], 
+                    method = "anova")
+
+##Saving our Predictions
+pred_train0 <- predict(model_tree0, train)
+pred_test0 <- predict(model_tree0, test)
+
+```
+
+
+```{r tree1 plot, echo=FALSE}
+
+prp(model_tree0, box.palette = spotycolor) ## el modelo usa mucho la variable artist
+
+```
+
+
+```{r tree assessment, echo=FALSE, cache=TRUE, message=FALSE, warning=FALSE}
+##############
+##ASSESSMENT##
+##############
+
+## Calidad de ajuste en Train 
+rmse_tree_train <- RMSE(pred_train0, train$popularity)
+rae_tree_train <- RAE(pred_train0, train$popularity)
+r2_tree_train <- R2_Score(pred_train0, train$popularity)
+## Validacion del modelo con Test
+rmse_tree_test <- RMSE(pred_test0, test$popularity)
+rae_tree_test <- RAE(pred_test0, test$popularity)
+r2_tree_test <- R2_Score(pred_test0, test$popularity)
+
+
+##TABLE###
+tree1 <- c(rmse_tree_test, rae_tree_test, r2_tree_test)
+
+comtable <- data.frame(criterio, regresion, tree1) 
+colnames(comtable) <- c("Criteria", "Linear Regression", "Decision Tree")
+
+knitr::kable(comtable, "html")
+
+```
+
+### 3.3. Decision Tree N°2: Prunning
+We create a loop for different levels of depth an choose the one that minimizes RMSE.
+```{r tree loop, cache=TRUE, message=FALSE, warning=FALSE}
+
+i=1                          
+tree.optm=1                     
+for (i in 1:12){ 
+    tree.mod <-  rpart(popularity ~ ., 
+                    data = train[,c(2:28)], 
+                    method = "anova",
+                    control = list(cp=0, maxdepth = i))
+    pred <- predict(tree.mod, newdata = test)
+    tree.optm[i] <- RMSE(pred, test$popularity)
+    k=i  
+    cat(k,'=', tree.optm[i],'\n')       
+}
+
+```
+
+We plot the resulting RMSE's:
+
+```{r rmse plot, echo=FALSE}
+
+  plot(tree.optm, type="b", xlab="K-Value", ylab="RMSE level") #maxdepth = 7
+
+```
+
+As you can see, the optimal level is $maxdepth=7$. We can now generate a pruned decision tree:
+
+```{r tree1 model, cache=TRUE, message=FALSE, warning=FALSE}
+model_tree1 <- rpart(popularity ~ ., 
+                    data = train[,c(2:28)], 
+                    method = "anova",
+                    control = list(cp=0, maxdepth = 7))
+
+##Saving our Predictions
+pred_train1 <- predict(model_tree1, train)
+pred_test1 <- predict(model_tree1, newdata = test)
+
+```
+
+We can plot the resulting tree.
+
+```{r plot tree2, echo=FALSE, cache=TRUE, message=FALSE, warning=FALSE}
+## Summary & Plot
+prp(model_tree1, box.palette = spotycolor) 
+
+```
+
+Because the figure is difficult to interpret, we can report the relative importance of each variable for the model:
+
+```{r relative importance1, echo=FALSE, cache=TRUE, message=FALSE, warning=FALSE}
+##Importancia de las Variables
+importance <- varImp(model_tree1) %>% 
+  arrange(desc(Overall)) %>% 
+  filter(Overall>0.1)
+variables <- c("artist", "year", "speechiness", "acousticness", "duration", "instrumentalness", "loudness", "energy", "explicit")
+
+knitr::kable(importance, "html")
+
+
+```
+
+### 3.4. Model Assessment
+```{r model assessment, echo=FALSE, cache=TRUE, message=FALSE, warning=FALSE}
+#############
+##EVALUAMOS##
+#############
+## Calidad de ajuste en Train 
+rmse_tree1_train <- RMSE(pred_train1, train$popularity)
+rae_tree1_train <- RAE(pred_train1, train$popularity)
+r2_tree1_train <- R2_Score(pred_train1, train$popularity)
+## Validacion del modelo con Test
+rmse_tree1_test <- RMSE(pred_test1, test$popularity)
+rae_tree1_test <- RAE(pred_test1, test$popularity)
+r2_tree1_test <- R2_Score(pred_test1, test$popularity)
+
+
+##TABLE###
+tree2 <- c(rmse_tree1_test, rae_tree1_test, r2_tree1_test)
+
+comtable <- data.frame(criterio, regresion, tree1, tree2) 
+colnames(comtable) <- c("Criteria", "Linear Regression", "Decision Tree", "Decision Tree (Pruned)")
+
+knitr::kable(comtable, "html")
+
+
+```
+The Pruned Decision Tree is the best model.
